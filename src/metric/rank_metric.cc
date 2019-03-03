@@ -159,6 +159,97 @@ struct EvalAuc : public Metric {
   }
 };
 
+/*! \brief EvalAverage @ topN --- changing from eval ranklist*/
+struct EvalAverage : public Metric {
+ public:
+  bst_float Eval(const HostDeviceVector<bst_float> &preds,
+                 const MetaInfo &info,
+                 bool distributed) override {
+    CHECK_EQ(preds.Size(), info.labels_.Size())
+        << "label size predict size not match";
+    // quick consistency when group is not available
+    std::vector<unsigned> tgptr(2, 0);
+    tgptr[1] = static_cast<unsigned>(preds.Size());
+    const std::vector<unsigned> &gptr = info.group_ptr_.size() == 0 ? tgptr : info.group_ptr_;
+    CHECK_NE(gptr.size(), 0U) << "must specify group when constructing rank file";
+    CHECK_EQ(gptr.back(), preds.Size())
+        << "EvalRanklist: group structure must match number of prediction";
+    const bst_omp_uint ngroup = static_cast<bst_omp_uint>(gptr.size() - 1);
+    const std::vector<bst_float>& h_preds = preds.HostVector();
+    // sum statistics
+    bst_float sum_average = 0.0f;
+    #pragma omp parallel reduction(+:sum_average)
+    {
+      // each thread takes a local rec
+      std::vector< std::pair<bst_float, bst_float> > rec;
+      #pragma omp for schedule(static)
+      for (bst_omp_uint k = 0; k < ngroup; ++k) {
+        rec.clear();
+        for (unsigned j = gptr[k]; j < gptr[k + 1]; ++j) {
+          rec.push_back(std::make_pair(h_preds[j], info.labels_.HostVector()[j]));
+        }
+        std::sort(rec.begin(), rec.end(), common::CmpFirst);
+        std::reverse(rec.begin(), rec.end());
+        bst_float sum_label_top = 0;
+        bst_float sum_label_bottom = 0;
+        if (topn_ > 0 || is_diff_) {
+          for (size_t j = 0; j < rec.size() && j < this->topn_; ++j) {
+            sum_label_top += rec[j].second;
+          }
+        }
+        if (topn_ < 0 || is_diff_) {
+          for (size_t j = 0; j < rec.size() && j < -this->topn_; ++j) {
+            sum_label_bottom += rec[rec.size() -j -1].second;
+          }
+        }
+        unsigned count = topn_;
+        if (rec.size() < topn_) {
+          count = rec.size();
+        }
+        sum_average += (sum_label_top - sum_label_bottom) / count;
+      }
+    }
+    if (distributed) {
+      bst_float dat[2];
+      dat[0] = static_cast<bst_float>(sum_average);
+      dat[1] = static_cast<bst_float>(ngroup);
+      // approximately estimate the metric using mean
+      rabit::Allreduce<rabit::op::Sum>(dat, 2);
+      return dat[0] / dat[1];
+    } else {
+      return sum_average / ngroup;
+    }
+  }
+  const char* Name() const override {
+    return name_.c_str();
+  }
+
+ public:
+  explicit EvalAverage(const char* name, const char* param) {
+    using namespace std;  // NOLINT(*)
+    if (param != nullptr) {
+      std::ostringstream os;
+      os << name << '@' << param;
+      name_ = os.str();
+
+      is_diff_ = (param[0] == 'd');
+      const char* part = param;
+      if (is_diff_) part += 1; 
+      if (sscanf(part, "%u", &topn_) != 1) {
+        topn_ = std::numeric_limits<unsigned>::max();
+      }
+    } else {
+      name_ = name;
+      topn_ = std::numeric_limits<unsigned>::max();
+    }
+  }
+
+ protected:
+  unsigned int topn_;
+  bool is_diff_;
+  std::string name_;
+};
+
 /*! \brief Evaluate rank list */
 struct EvalRankList : public Metric {
  public:
@@ -462,6 +553,10 @@ XGBOOST_REGISTER_METRIC(AMS, "ams")
 XGBOOST_REGISTER_METRIC(Auc, "auc")
 .describe("Area under curve for both classification and rank.")
 .set_body([](const char* param) { return new EvalAuc(); });
+
+XGBOOST_REGISTER_METRIC(Average, "avg")
+.describe("average@k for rank.")
+.set_body([](const char* param) { return new EvalAverage("avg", param); });
 
 XGBOOST_REGISTER_METRIC(AucPR, "aucpr")
 .describe("Area under PR curve for both classification and rank.")
